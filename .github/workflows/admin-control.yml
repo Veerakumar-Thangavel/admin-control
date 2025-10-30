@@ -1,1 +1,120 @@
+name: Build & Deploy Upstar Admin Panel
 
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: 'ap-southeast-1'
+  FRONTEND_ECR: '911167886240.dkr.ecr.us-east-1.amazonaws.com/upstar-frontend'
+  BACKEND_ECR: '911167886240.dkr.ecr.us-east-1.amazonaws.com/upstar-backend'
+  S3_BUCKET: 'upstar-codedeploy'
+  CODEDEPLOY_APP: 'upstar'
+  DEPLOYMENT_GROUP: 'upstar-api-dev-deployment-group'
+  EC2_TAG_KEY: Name
+  EC2_TAG_VALUE: upstar-api-dev
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    steps:
+
+    #  Checkout code
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    #  Setup Docker Buildx
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    #  Configure AWS credentials
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        role-session-name: GitHubActions-Deploy
+        aws-region: ${{ env.AWS_REGION }}
+
+    #  Login to Amazon ECR
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    #  Build and Push Backend Docker Image
+    - name: Build & Push Backend Image
+      uses: docker/build-push-action@v3
+      with:
+        context: ./upstar-backend
+        file: ./upstar-backend/Dockerfile
+        push: true
+        tags: ${{ env.BACKEND_ECR }}:${{ github.sha }}
+        platforms: linux/amd64
+
+    #  Build and Push Frontend Docker Image
+    - name: Build & Push Frontend Image
+      uses: docker/build-push-action@v3
+      with:
+        context: ./upstar-website
+        file: ./upstar-website/Dockerfile
+        push: true
+        tags: ${{ env.FRONTEND_ECR }}:${{ github.sha }}
+        platforms: linux/amd64
+
+    #  Package deployment files for CodeDeploy
+    - name: Prepare Deployment Package
+      run: |
+        echo "GITHUB_SHA=${{ github.sha }}" > deployment/scripts/.env
+        chmod +x deployment/scripts/deploy.sh
+        cd deployment
+        zip -r upstar-deploy.zip docker-compose.yml appspec.yml scripts/deploy.sh scripts/.env
+        aws s3 cp upstar-deploy.zip s3://$S3_BUCKET/
+
+    #  Update deployment group for EC2
+    - name: Update Deployment Group
+      run: |
+        aws deploy update-deployment-group \
+          --application-name $CODEDEPLOY_APP \
+          --current-deployment-group-name $DEPLOYMENT_GROUP \
+          --ec2-tag-filters Key=$EC2_TAG_KEY,Value=$EC2_TAG_VALUE,Type=KEY_AND_VALUE \
+          --region $AWS_REGION
+
+    #  Deploy to EC2 via CodeDeploy
+    - name: Deploy to EC2
+      id: codedeploy
+      run: |
+        DEPLOY_ID=$(aws deploy create-deployment \
+          --application-name $CODEDEPLOY_APP \
+          --deployment-group-name $DEPLOYMENT_GROUP \
+          --s3-location bucket=$S3_BUCKET,bundleType=zip,key=upstar-deploy.zip \
+          --region $AWS_REGION \
+          --query 'deploymentId' --output text)
+        echo "deployment_id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+
+    #  Wait for deployment to finish
+    - name: Wait for Deployment Completion
+      run: |
+        DEPLOY_ID=${{ steps.codedeploy.outputs.deployment_id }}
+        STATUS=$(aws deploy get-deployment --deployment-id $DEPLOY_ID \
+          --query 'deploymentInfo.status' --output text)
+        echo "Waiting for deployment $DEPLOY_ID..."
+        while [[ "$STATUS" == "Created" || "$STATUS" == "Queued" || "$STATUS" == "InProgress" ]]; do
+          sleep 30
+          STATUS=$(aws deploy get-deployment --deployment-id $DEPLOY_ID \
+            --query 'deploymentInfo.status' --output text)
+        done
+        echo "Final deployment status: $STATUS"
+        if [[ "$STATUS" != "Succeeded" ]]; then
+          echo "Deployment failed!"
+          exit 1
+        fi
