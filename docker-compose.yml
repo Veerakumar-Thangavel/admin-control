@@ -1,0 +1,45 @@
+version: '3.9'
+
+services:
+  db:
+    image: postgres:16
+    container_name: upstar-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: upstar_user
+      POSTGRES_PASSWORD: upstar123
+      POSTGRES_DB: upstar_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./upstar-backend
+      dockerfile: Dockerfile.back   # updated to your backend Dockerfile
+    container_name: upstar-backend
+    restart: always
+    env_file:
+      - ./upstar-backend/env.local
+    ports:
+      - "5000:5000"
+    depends_on:
+      - db
+
+  frontend:
+    build:
+      context: ./upstar-website
+      dockerfile: Dockerfile.front  # updated to your frontend Dockerfile
+    container_name: upstar-frontend
+    restart: always
+    env_file:
+      - ./upstar-website/.env.local
+    ports:
+      - "3001:3000"
+    depends_on:
+      - backend
+
+volumes:
+  db_data:
+
